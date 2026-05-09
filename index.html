@@ -616,6 +616,58 @@
     let originalOrder = [];
     let editingSongIndex = null;
 
+    // IndexedDB for persisting uploaded audio blobs across reloads
+    const DB_NAME = 'music_player_db';
+    const DB_VERSION = 1;
+    const FILE_STORE = 'files';
+
+    function openDB() {
+        return new Promise((resolve, reject) => {
+            const req = indexedDB.open(DB_NAME, DB_VERSION);
+            req.onupgradeneeded = (e) => {
+                const db = e.target.result;
+                if (!db.objectStoreNames.contains(FILE_STORE)) {
+                    db.createObjectStore(FILE_STORE, { keyPath: 'key' });
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error);
+        });
+    }
+
+    async function saveFileToDB(key, file) {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(FILE_STORE, 'readwrite');
+            const store = tx.objectStore(FILE_STORE);
+            store.put({ key, file });
+            tx.oncomplete = () => { db.close(); resolve(); };
+            tx.onerror = () => { db.close(); reject(tx.error); };
+        });
+    }
+
+    async function getFileFromDB(key) {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(FILE_STORE, 'readonly');
+            const store = tx.objectStore(FILE_STORE);
+            const req = store.get(key);
+            req.onsuccess = () => { db.close(); resolve(req.result ? req.result.file : null); };
+            req.onerror = () => { db.close(); reject(req.error); };
+        });
+    }
+
+    async function deleteFileFromDB(key) {
+        const db = await openDB();
+        return new Promise((resolve, reject) => {
+            const tx = db.transaction(FILE_STORE, 'readwrite');
+            const store = tx.objectStore(FILE_STORE);
+            store.delete(key);
+            tx.oncomplete = () => { db.close(); resolve(); };
+            tx.onerror = () => { db.close(); reject(tx.error); };
+        });
+    }
+
     // DOM Elements
     const audioPlayer = document.getElementById("audio-player");
     const progressBar = document.getElementById("progress-bar");
@@ -659,15 +711,39 @@
 
     function savePlaylist() {
         if (currentUser) {
-            localStorage.setItem(`playlist_${currentUser.username}`, JSON.stringify(playlist));
+            // strip runtime-only fields (like _objectUrl) before saving
+            const toSave = playlist.map(s => {
+                const copy = { ...s };
+                if (copy._objectUrl) delete copy._objectUrl;
+                return copy;
+            });
+            localStorage.setItem(`playlist_${currentUser.username}`, JSON.stringify(toSave));
         }
     }
 
-    function loadPlaylist() {
+    async function loadPlaylist() {
         if (currentUser) {
             const saved = localStorage.getItem(`playlist_${currentUser.username}`);
             if (saved) {
                 playlist = JSON.parse(saved);
+                // Rehydrate uploaded file blobs from IndexedDB
+                for (let i = 0; i < playlist.length; i++) {
+                    const song = playlist[i];
+                    if (song.blobKey) {
+                        try {
+                            const file = await getFileFromDB(song.blobKey);
+                            if (file) {
+                                const objUrl = URL.createObjectURL(file);
+                                song.url = objUrl;
+                                song._objectUrl = objUrl; // runtime-only
+                            } else {
+                                song.url = song.url || "";
+                            }
+                        } catch (err) {
+                            console.error('Error loading blob', song.blobKey, err);
+                        }
+                    }
+                }
                 originalOrder = [...playlist];
                 renderPlaylist();
                 updateStats();
@@ -712,7 +788,7 @@
     });
 
     // Login
-    document.getElementById("login-form").addEventListener("submit", (e) => {
+    document.getElementById("login-form").addEventListener("submit", async (e) => {
         e.preventDefault();
         const username = document.getElementById("username").value.trim();
         const password = document.getElementById("password").value;
@@ -721,7 +797,7 @@
             currentUser = user;
             document.getElementById("auth-section").style.display = "none";
             document.getElementById("playlist-container").style.display = "block";
-            loadPlaylist();
+            await loadPlaylist();
         } else {
             showMessage("Invalid username or password", "error");
         }
@@ -751,6 +827,12 @@
 
     // Logout
     document.getElementById("logout-btn").addEventListener("click", () => {
+        // revoke any runtime object URLs
+        for (const s of playlist) {
+            if (s && s._objectUrl) {
+                try { URL.revokeObjectURL(s._objectUrl); } catch (e) {}
+            }
+        }
         currentUser = null;
         playlist = [];
         audioPlayer.pause();
@@ -913,8 +995,16 @@
         document.getElementById("loop-btn").textContent = isLooping ? "Loop On" : "Loop";
     });
 
-    document.getElementById("clear-playlist-btn").addEventListener("click", () => {
+    document.getElementById("clear-playlist-btn").addEventListener("click", async () => {
         if (confirm("Clear all songs from playlist?")) {
+            // delete persisted uploaded blobs
+            for (const s of playlist) {
+                if (s.blobKey) {
+                    try { await deleteFileFromDB(s.blobKey); } catch (err) { console.warn('failed delete blob', s.blobKey, err); }
+                }
+                if (s._objectUrl) URL.revokeObjectURL(s._objectUrl);
+            }
+
             playlist = [];
             originalOrder = [];
             audioPlayer.src = "";
@@ -930,7 +1020,16 @@
         }
     });
 
-    function removeSong(index) {
+    async function removeSong(index) {
+        const song = playlist[index];
+        if (!song) return;
+        if (song.blobKey) {
+            try { await deleteFileFromDB(song.blobKey); } catch (err) { console.warn('failed delete blob', song.blobKey, err); }
+        }
+        if (song._objectUrl) {
+            try { URL.revokeObjectURL(song._objectUrl); } catch (e) {}
+        }
+
         playlist.splice(index, 1);
         originalOrder = [...playlist];
         if (currentSong >= playlist.length) currentSong = Math.max(0, playlist.length - 1);
@@ -1000,23 +1099,50 @@
     document.getElementById("search-input").addEventListener("input", renderPlaylist);
 
     // File Upload
-    document.getElementById("file-upload").addEventListener("change", (event) => {
+    document.getElementById("file-upload").addEventListener("change", async (event) => {
         const file = event.target.files[0];
-        if (file) {
-            const fileURL = URL.createObjectURL(file);
-            const fileName = file.name.replace(/\.[^/.]+$/, "");
-            playlist.push({
-                title: fileName,
-                url: fileURL,
-                lyrics: "",
-                duration: 0,
-                addedAt: Date.now()
-            });
-            originalOrder = [...playlist];
-            savePlaylist();
-            renderPlaylist();
-            updateStats();
+        if (!file) {
+            event.target.value = "";
+            return;
         }
+        if (!currentUser) {
+            showMessage("Please login before uploading files", "error");
+            event.target.value = "";
+            return;
+        }
+
+        const fileURL = URL.createObjectURL(file);
+        const fileName = file.name.replace(/\.[^/.]+$/, "");
+        const addedAt = Date.now();
+        const blobKey = `${currentUser.username}_${addedAt}`;
+
+        try {
+            await saveFileToDB(blobKey, file);
+        } catch (err) {
+            console.error('Failed to save file to DB', err);
+            showMessage('Failed to save uploaded file', 'error');
+            event.target.value = "";
+            return;
+        }
+
+        const song = {
+            title: fileName,
+            url: fileURL,
+            lyrics: "",
+            duration: 0,
+            addedAt,
+            blobKey
+        };
+
+        // runtime-only pointer so we can revoke when removed
+        song._objectUrl = fileURL;
+
+        playlist.push(song);
+        originalOrder = [...playlist];
+        savePlaylist();
+        renderPlaylist();
+        updateStats();
+
         event.target.value = "";
     });
 
